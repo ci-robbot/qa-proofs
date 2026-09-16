@@ -1,0 +1,206 @@
+================================================================================
+QA proof: kairos-io/kairos#4590 — AuroraBoot show machine IP, updated with the
+heartbeat. Implementing PR: kairos-io/AuroraBoot#804.
+Operator: ci-robbot. Date: 2026-09-16 (UTC).
+================================================================================
+
+ENVIRONMENT
+-----------
+AuroraBoot under test : PR #804 head 30b699c582cd, test-merged with current
+                        origin/main d48afc5c1f37 ("feat: stream PXE/netboot
+                        server logs to the UI (#806)"). Merge commit d82ff1f.
+                        Merge was clean; diff vs main is only the PR's own
+                        15 files / 78 insertions.
+                        Built with `make build` (React UI + Go binary).
+Agent under test      : real `kairos-agent phone-home`, built from
+                        kairos-io/kairos master 73706def (agent/, CGO_ENABLED=0
+                        GOOS=linux GOARCH=amd64).
+                        sha256 6bed9895a953a9d3c81ba42ee68a3dd8e473df0352e8e81d795cb77b49c379f5
+Host                  : Linux 6.8.0-139-generic, Ubuntu 24.04.3 LTS
+Browser               : Chrome/153.0.8010.12 headless, driven over raw CDP
+Server                : ./auroraboot web --listen 10.99.0.1:9990
+Node network          : network namespace `qa4590` on a veth pair
+                        (host qa-h 10.99.0.1/24 <-> ns qa-g 10.99.0.2/24), so
+                        the agent's source address is real and changeable.
+
+WHY RE-TEST: PR #804 was QA'd on 2026-09-15 against main 3ec2084. main has since
+advanced by one commit (#806, which touches the UI and pkg/ws/hub.go), so this
+run verifies the issue's acceptance criteria with #804 merged into current main.
+
+--------------------------------------------------------------------------------
+1. MERGE AND BUILD
+--------------------------------------------------------------------------------
+$ git merge qa-main-tmp          # qa-main-tmp = origin/main d48afc5
+  Merge made by the 'ort' strategy.  21 files changed, 1015 insertions(+), 38 deletions(-)
+$ git rev-parse --short HEAD
+  d82ff1f
+$ git diff --stat qa-main-tmp...HEAD | tail -1
+  15 files changed, 78 insertions(+), 23 deletions(-)
+$ make build
+  Go binary built successfully!   (exit 0)
+
+--------------------------------------------------------------------------------
+2. REGISTER: remoteIP populated at register time
+--------------------------------------------------------------------------------
+$ sudo ip netns exec qa4590 env PHONEHOME_URL=http://10.99.0.1:9990 \
+    PHONEHOME_REGISTRATION_TOKEN=qa-reg-4590 kairos-agent phone-home --heartbeat-interval 10s
+2026-09-16T23:09:42Z INF Kairos Agent version=dev
+2026-09-16T23:09:42Z INF Boot Mode boot_mode=unknown
+2026-09-16T23:09:42Z INF Boot in uki mode result=false
+2026-09-16T23:09:42Z INF registered as node fbfb0446-f4a3-42fc-8725-345366e3030e
+2026-09-16T23:09:42Z INF connected to ws://10.99.0.1:9990/api/v1/ws?token=30eaccb94a7c95dc0a12da0ed07281d876ed60da018749b4ff7180ff200b5891
+
+$ curl -s .../api/v1/nodes -H "Authorization: Bearer <admin>" | jq .
+[
+  {
+    "id": "fbfb0446-f4a3-42fc-8725-345366e3030e",
+    "hostname": "devbox-kairos",
+    "phase": "Online",
+    "lastHeartbeat": "2026-09-16T23:10:02.052091451Z",
+    "agentVersion": "dev",
+    "addresses": [
+      { "type": "InternalIP", "address": "10.99.0.2" },
+      { "type": "Hostname",   "address": "devbox-kairos" }
+    ],
+    "remoteIP": "10.99.0.2",
+    "bootState": "unknown",
+    "createdAt": "2026-09-16T23:09:42.040552675Z",
+    "updatedAt": "2026-09-16T23:10:02.052394443Z"
+  }
+]
+
+UI, before the address change (screenshots 01 and 02):
+  nodes list  : columns  Hostname | Group | Labels | Phase | OS Version | IP | Last Heartbeat | Status
+                row      devbox-kairos | - | | Online | dev | 10.99.0.2 | 3s ago | Online
+  node detail : "IP Address   10.99.0.2"  in the Node Info card
+
+--------------------------------------------------------------------------------
+3. ADDRESS CHANGE: the heartbeat refreshes remoteIP  (the acceptance criterion)
+--------------------------------------------------------------------------------
+T0 = 23:19:19Z
+
+$ curl .../nodes | jq            # baseline
+  remoteIP=10.99.0.2 phase=Online hb=2026-09-16T23:19:08.526683275Z
+
+$ sudo ip netns exec qa4590 ip addr del 10.99.0.2/24  dev qa-g
+$ sudo ip netns exec qa4590 ip addr add 10.99.0.55/24 dev qa-g
+$ sudo ip netns exec qa4590 ip route replace default via 10.99.0.1
+$ sudo ip netns exec qa4590 ip -brief addr show qa-g
+  qa-g@if1005      UP             10.99.0.55/24
+$ sudo ip netns exec qa4590 ss -K dst 10.99.0.1     # drop the now-stale socket
+  tcp   ESTAB 0 0   10.99.0.2:57220   10.99.0.1:9990
+
+$ while ...; do curl .../nodes; done
+  t+5s remoteIP=10.99.0.55 phase=Online hb=2026-09-16T23:19:24.561644357Z addrs=10.99.0.2,devbox-kairos
+  >>> UPDATED at t+5s
+
+agent log (reconnect with the SAME credentials, no re-registration):
+  2026-09-16T23:18:58Z INF loaded existing credentials for node fbfb0446-f4a3-42fc-8725-345366e3030e
+  2026-09-16T23:18:58Z INF connected to ws://10.99.0.1:9990/api/v1/ws?token=30eacc...
+  2026-09-16T23:19:24Z INF connected to ws://10.99.0.1:9990/api/v1/ws?token=30eacc...
+
+$ curl .../nodes | jq 'length, [.[].id]'      # still one node, same id
+  1
+  ["fbfb0446-f4a3-42fc-8725-345366e3030e"]
+
+NOTE, and this is the point of the feature: at t+5s the agent's own
+self-reported `addresses` list still reads 10.99.0.2 (stale, captured at
+register time) while `remoteIP` reads 10.99.0.55. The displayed IP is
+server-observed and independent of what the agent reports about itself.
+
+UI, after the address change (screenshots 03 and 04):
+  nodes list  : devbox-kairos | - | | Online | dev | 10.99.0.55 | 1s ago | Online
+  node detail : "IP Address   10.99.0.55"
+
+--------------------------------------------------------------------------------
+4. REST HEARTBEAT PATH (older / non-WebSocket agents)
+--------------------------------------------------------------------------------
+Agent stopped first, so the 10s WebSocket heartbeat cannot race the writes.
+
+$ for SRC in 10.99.0.77 10.99.0.55 10.99.0.77; do
+    curl --interface $SRC -X POST .../api/v1/nodes/$NID/heartbeat \
+      -H "Authorization: Bearer <nodekey>" -d "{\"agentVersion\":\"qa-rest-$SRC\"}"
+  done
+  POST from 10.99.0.77 http=200   stored remoteIP=10.99.0.77 agentVersion=qa-rest-10.99.0.77
+  POST from 10.99.0.55 http=200   stored remoteIP=10.99.0.55 agentVersion=qa-rest-10.99.0.55
+  POST from 10.99.0.77 http=200   stored remoteIP=10.99.0.77 agentVersion=qa-rest-10.99.0.77
+
+Every REST heartbeat tracks its own source address.
+
+--------------------------------------------------------------------------------
+5. UPGRADE PATH: a database created by current main, opened by the PR build
+--------------------------------------------------------------------------------
+$ /tmp/qa4590-ab-main web --data-dir /tmp/qa4590-updata ...    # main d48afc5
+$ curl .../nodes | jq '.[0] | {id, hostname, remoteIP}'        # against main
+  main-registered node: id=3c133a12-cabe-43f7-a090-193ddd6623fc
+                        hostname=devbox-kairos  remoteIP=<absent>
+$ python3 -c "PRAGMA table_info(managed_nodes)"                # before
+  remote_ip present: False
+
+  ... stop main, start the PR build on the SAME data-dir ...
+
+$ ./auroraboot web --data-dir /tmp/qa4590-updata ...           # PR build
+$ python3 -c "PRAGMA table_info(managed_nodes)"                # after
+  remote_ip present: True
+  cols: id, machine_id, hostname, group_id, phase, last_heartbeat, agent_version,
+        os_release, labels, addresses, boot_state, claim_key, claimed_at,
+        reset_state, reset_requested_at, last_reset, api_key, created_at,
+        updated_at, remote_ip
+  rows: [('3c133a12-cabe-43f7-a090-193ddd6623fc', 'devbox-kairos', None)]
+
+The pre-existing row survives with every other field intact and a NULL IP.
+The API returns "remoteIP": null and the nodes list renders it as "-"
+(screenshot 05):
+  devbox-kairos | - | | Offline | dev | - | 29s ago | Offline
+
+Then the first heartbeat backfills it:
+  t+5s remoteIP=10.99.0.55 phase=Online
+  db rows: [('devbox-kairos', '10.99.0.55')]
+
+AutoMigrate is additive: the column is appended, nothing is rewritten.
+
+--------------------------------------------------------------------------------
+6. TESTS ON THE MERGED HEAD (d82ff1f)
+--------------------------------------------------------------------------------
+$ go test ./pkg/handlers/... ./pkg/ws/... ./pkg/auth/... ./pkg/server/... ./internal/store/...
+  ok  github.com/kairos-io/AuroraBoot/pkg/handlers       0.366s
+  ok  github.com/kairos-io/AuroraBoot/pkg/ws             7.909s
+  ok  github.com/kairos-io/AuroraBoot/pkg/auth           0.008s
+  ok  github.com/kairos-io/AuroraBoot/pkg/server         0.037s
+  ok  github.com/kairos-io/AuroraBoot/internal/store/gorm 0.331s
+  exit 0
+
+$ cd ui && npm test -- --run
+  Test Files  11 passed (11)
+       Tests  69 passed (69)
+  exit 0
+
+--------------------------------------------------------------------------------
+7. OBSERVATIONS (neither is a defect in this PR; both already reported on #804)
+--------------------------------------------------------------------------------
+(a) c.RealIP() trusts X-Forwarded-For from any client, because e.IPExtractor is
+    never set in the repo. A node that sets the header writes whatever it wants,
+    so the stored value is a display hint rather than an unspoofable
+    server-observed fact unless AuroraBoot sits behind a trusted proxy. The same
+    echo default already governs the per-client-IP registration rate limiter on
+    main, so this predates this diff. Worth a follow-up about IPExtractor /
+    trusted proxies.
+
+(b) Agent-side, not AuroraBoot: when the address is removed out from under a
+    live WebSocket, the agent keeps writing into the dead socket and heartbeats
+    stall well past 60s, so the IP only refreshes once the connection actually
+    drops. Reproduced again in this run:
+
+      $ sudo ip netns exec qa4590 ss -tanp
+        ESTAB 0 9152  10.99.0.2:42616  10.99.0.1:9990 users:(("qa4590-kairos-a",pid=1321452,fd=8))
+      t+85s  remoteIP=10.99.0.2 phase=Offline
+      t+320s remoteIP=10.99.0.2 phase=Offline     # still wedged, 5+ min
+      agent log: no reconnect attempt logged at all
+
+    Forcing the socket to drop (`ss -K`, or a real link flap / node reboot) makes
+    the refresh land in under 5s, as section 3 shows. This is kairos-agent
+    reconnect behaviour and does not affect AuroraBoot's acceptance criteria.
+
+--------------------------------------------------------------------------------
+RESULT: PASS
+--------------------------------------------------------------------------------
